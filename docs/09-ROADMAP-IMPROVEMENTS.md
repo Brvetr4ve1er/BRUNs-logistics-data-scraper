@@ -410,12 +410,16 @@ requires manual SQL. Unacceptable for a product being sold to operators.
 
 **Effort:** Half a day.
 
-### N3 — Apache Parquet export endpoint
+### N3 — Apache Parquet export endpoint ✅ DONE
 
-`/api/logistics/shipments_full.parquet` — 10× faster ingest into Power BI
-than JSON pagination. `pyarrow` is already a transitive dep.
-
-**Effort:** Half a day.
+`/api/logistics/shipments_full.parquet` is live — returns the full flat
+shipments+containers view as a single Apache Parquet file (~10× faster ingest
+into Power BI than JSON pagination). The column projection is shared with the
+JSON endpoint via `_SHIPMENTS_FULL_SELECT`, so the two can never drift; the
+same `status` / `carrier` / `tan` filters apply. `pyarrow` is now an explicit
+runtime dependency. Empty result sets still carry the full column schema (built
+from the cursor description). If `pyarrow` is missing the endpoint returns a
+clear `503` instead of a 500 traceback.
 
 ### N4 — Pre-computed analytics API
 

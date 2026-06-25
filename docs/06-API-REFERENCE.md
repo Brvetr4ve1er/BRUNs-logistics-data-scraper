@@ -178,6 +178,37 @@ GET /api/logistics/shipments_full?carrier=MSC&status=IN_TRANSIT
 
 ---
 
+### `GET /api/logistics/shipments_full.parquet` ⭐ Bulk BI export
+
+Same flat view and columns as `shipments_full`, but returned as a single
+**Apache Parquet** file instead of paginated JSON. Power BI and pandas ingest
+this ~10× faster than paging through JSON, and the binary columnar encoding is
+a fraction of the size on the wire.
+
+Unlike the JSON endpoint this is **not paginated** — the entire filtered result
+set comes back in one file.
+
+**Filters:** identical to `shipments_full` — `status`, `carrier`, `tan`.
+
+**Response:** `Content-Type: application/vnd.apache.parquet`, served as an
+attachment named `shipments_full.parquet`. Columns match the JSON endpoint
+exactly (the column projection is shared in code, so the two can never drift).
+An empty result still carries the full column schema.
+
+**Example (Power BI / pandas):**
+```python
+import pandas as pd
+df = pd.read_parquet("http://localhost:7845/api/logistics/shipments_full.parquet?carrier=MSC")
+```
+
+In Power BI Desktop: **Get Data → Web → URL** → paste the endpoint. Power BI
+detects the Parquet format automatically.
+
+> Requires `pyarrow` (installed via `requirements.txt`). If it is missing the
+> endpoint returns `503` with a clear message rather than a 500 traceback.
+
+---
+
 ## Travel endpoints
 
 ### `GET /api/travel/persons`
@@ -292,7 +323,7 @@ on upload/edit/delete routes. These are tracked in
 
 | Endpoint | Purpose | Status |
 |----------|---------|--------|
-| `GET /api/logistics/shipments_full.parquet` | Bulk export in Parquet (10× faster for Power BI) | Planned (N3) |
+| `GET /api/logistics/shipments_full.parquet` | Bulk export in Parquet (10× faster for Power BI) | ✅ Live (N3) |
 | `GET /api/analytics/kpis` | Pre-computed logistics KPIs (avg demurrage, transit time, etc.) | Planned (N4) |
 | `GET /api/analytics/carrier-performance` | Per-carrier performance metrics | Planned (N4) |
 | `GET /api/logistics/odata/$metadata` | OData v4 service document | Planned (L3) |

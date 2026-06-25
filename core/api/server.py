@@ -163,6 +163,84 @@ def logistics_containers():
 
 # ─── Logistics: Flat denormalized view (one row per container) ─────────────────
 # This is the primary endpoint for Power BI — no joins needed on the BI side.
+# The JSON endpoint (paginated) and the Parquet endpoint (bulk) share the same
+# column projection and filters via the constants below so they can never drift.
+
+# Column projection + join, with a {where_sql} placeholder. No ORDER BY/LIMIT —
+# callers append those. Keeping this in one place guarantees the JSON and
+# Parquet exports expose identical columns to Power BI.
+_SHIPMENTS_FULL_SELECT = """
+    SELECT
+        s.id                    AS shipment_id,
+        c.id                    AS container_id,
+        c.container_number      AS "N° Container",
+        s.tan                   AS "N° TAN",
+        s.item_description      AS "Item",
+        s.compagnie_maritime    AS "Compagnie maritime",
+        s.port                  AS "Port",
+        s.transitaire           AS "Transitaire",
+        s.vessel                AS "Navire",
+        s.etd                   AS "Date shipment",
+        s.eta                   AS "Date accostage",
+        s.status                AS "Statut Expédition",
+        s.document_type         AS "Type document",
+        c.statut_container      AS "Statut Container",
+        c.size                  AS "Container size",
+        c.seal_number           AS "N° Seal",
+        c.date_livraison        AS "Date livraison",
+        c.site_livraison        AS "Site livraison",
+        c.date_depotement       AS "Date dépotement",
+        c.date_debut_surestarie AS "Date début Surestarie",
+        c.date_restitution_estimative AS "Date restitution estimative",
+        c.nbr_jours_surestarie_estimes AS "Nbr jours surestarie estimés",
+        c.nbr_jours_perdu_douane       AS "Nbr jours perdu en douane",
+        c.date_restitution      AS "Date réstitution",
+        c.restitue_camion       AS "Réstitué par (Camion)",
+        c.restitue_chauffeur    AS "Réstitué par (Chauffeur)",
+        c.centre_restitution    AS "Centre de réstitution",
+        c.livre_camion          AS "Livré par (Camion)",
+        c.livre_chauffeur       AS "Livré par (Chauffeur)",
+        c.montant_facture_check AS "Montant facturé (check)",
+        c.nbr_jour_surestarie_facture AS "Nbr jour surestarie Facturé",
+        c.montant_facture_da    AS "Montant facturé (DA)",
+        c.taux_de_change        AS "Taux de change",
+        c.n_facture_cm          AS "N° Facture compagnie maritime",
+        c.commentaire           AS "Commentaire",
+        c.date_declaration_douane   AS "Date declaration douane",
+        c.date_liberation_douane    AS "Date liberation douane",
+        s.source_file           AS "Source",
+        c.created_at            AS "Créé le",
+        c.modified_at           AS "Modifié le"
+    FROM containers c
+    JOIN shipments s ON s.id = c.shipment_id
+    {where_sql}
+    ORDER BY c.id DESC
+"""
+
+
+def _shipments_full_where():
+    """Build the WHERE clause + params for the flat view from request args.
+
+    Shared by the JSON and Parquet endpoints so both honour the same
+    status / carrier / tan filters.
+    """
+    where_clauses = []
+    params = []
+    status  = request.args.get("status")
+    carrier = request.args.get("carrier")
+    tan     = request.args.get("tan")
+    if status:
+        where_clauses.append("s.status = ?")
+        params.append(status)
+    if carrier:
+        where_clauses.append("s.compagnie_maritime = ?")
+        params.append(carrier)
+    if tan:
+        where_clauses.append("s.tan LIKE ?")
+        params.append(f"%{tan}%")
+    where_sql = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+    return where_sql, params
+
 
 @app.route("/api/logistics/shipments_full")
 def logistics_shipments_full():
@@ -175,24 +253,7 @@ def logistics_shipments_full():
 
     conn = get_connection(LOGISTICS_DB)
     try:
-        # Optional filters
-        status    = request.args.get("status")
-        carrier   = request.args.get("carrier")
-        tan       = request.args.get("tan")
-
-        where_clauses = []
-        params = []
-        if status:
-            where_clauses.append("s.status = ?")
-            params.append(status)
-        if carrier:
-            where_clauses.append("s.compagnie_maritime = ?")
-            params.append(carrier)
-        if tan:
-            where_clauses.append("s.tan LIKE ?")
-            params.append(f"%{tan}%")
-
-        where_sql = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+        where_sql, params = _shipments_full_where()
 
         total = conn.execute(
             f"SELECT COUNT(*) FROM containers c JOIN shipments s ON s.id = c.shipment_id {where_sql}",
@@ -200,54 +261,7 @@ def logistics_shipments_full():
         ).fetchone()[0]
 
         rows = conn.execute(
-            f"""
-            SELECT
-                s.id                    AS shipment_id,
-                c.id                    AS container_id,
-                c.container_number      AS "N° Container",
-                s.tan                   AS "N° TAN",
-                s.item_description      AS "Item",
-                s.compagnie_maritime    AS "Compagnie maritime",
-                s.port                  AS "Port",
-                s.transitaire           AS "Transitaire",
-                s.vessel                AS "Navire",
-                s.etd                   AS "Date shipment",
-                s.eta                   AS "Date accostage",
-                s.status                AS "Statut Expédition",
-                s.document_type         AS "Type document",
-                c.statut_container      AS "Statut Container",
-                c.size                  AS "Container size",
-                c.seal_number           AS "N° Seal",
-                c.date_livraison        AS "Date livraison",
-                c.site_livraison        AS "Site livraison",
-                c.date_depotement       AS "Date dépotement",
-                c.date_debut_surestarie AS "Date début Surestarie",
-                c.date_restitution_estimative AS "Date restitution estimative",
-                c.nbr_jours_surestarie_estimes AS "Nbr jours surestarie estimés",
-                c.nbr_jours_perdu_douane       AS "Nbr jours perdu en douane",
-                c.date_restitution      AS "Date réstitution",
-                c.restitue_camion       AS "Réstitué par (Camion)",
-                c.restitue_chauffeur    AS "Réstitué par (Chauffeur)",
-                c.centre_restitution    AS "Centre de réstitution",
-                c.livre_camion          AS "Livré par (Camion)",
-                c.livre_chauffeur       AS "Livré par (Chauffeur)",
-                c.montant_facture_check AS "Montant facturé (check)",
-                c.nbr_jour_surestarie_facture AS "Nbr jour surestarie Facturé",
-                c.montant_facture_da    AS "Montant facturé (DA)",
-                c.taux_de_change        AS "Taux de change",
-                c.n_facture_cm          AS "N° Facture compagnie maritime",
-                c.commentaire           AS "Commentaire",
-                c.date_declaration_douane   AS "Date declaration douane",
-                c.date_liberation_douane    AS "Date liberation douane",
-                s.source_file           AS "Source",
-                c.created_at            AS "Créé le",
-                c.modified_at           AS "Modifié le"
-            FROM containers c
-            JOIN shipments s ON s.id = c.shipment_id
-            {where_sql}
-            ORDER BY c.id DESC
-            LIMIT ? OFFSET ?
-            """,
+            _SHIPMENTS_FULL_SELECT.format(where_sql=where_sql) + " LIMIT ? OFFSET ?",
             params + [page_size, offset]
         ).fetchall()
 
@@ -265,6 +279,61 @@ def logistics_shipments_full():
         })
     finally:
         conn.close()
+
+
+@app.route("/api/logistics/shipments_full.parquet")
+def logistics_shipments_full_parquet():
+    """Bulk Apache Parquet export of the flat shipments + containers view.
+
+    Unlike the JSON endpoint, this is NOT paginated — it returns the entire
+    filtered result set as a single columnar Parquet file. Power BI / pandas
+    ingest this ~10× faster than paging through JSON, and the binary columnar
+    encoding is a fraction of the size on the wire.
+
+    Honours the same optional filters as the JSON endpoint:
+        ?status=  ?carrier=  ?tan=
+
+    Example (Power BI / Python):
+        pd.read_parquet("http://localhost:7845/api/logistics/shipments_full.parquet")
+    """
+    if not os.path.exists(LOGISTICS_DB):
+        abort(404, "logistics database not found")
+
+    try:
+        import io
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+    except ImportError:
+        # pyarrow ships with pandas, but guard so a misconfigured install
+        # returns a clear error instead of a 500 traceback.
+        abort(503, "pyarrow is required for Parquet export — run: pip install pyarrow")
+
+    conn = get_connection(LOGISTICS_DB)
+    try:
+        where_sql, params = _shipments_full_where()
+        cursor = conn.execute(_SHIPMENTS_FULL_SELECT.format(where_sql=where_sql), params)
+        # Pull column names from the cursor so the schema is correct even when
+        # the result set is empty (rows[0] would be unavailable).
+        col_names = [d[0] for d in cursor.description]
+        rows = cursor.fetchall()
+    finally:
+        conn.close()
+
+    # Build a columnar pyarrow Table directly from the rows. pyarrow infers each
+    # column's type from its values and tolerates NULLs mixed with strings/ints.
+    columns = {name: [row[i] for row in rows] for i, name in enumerate(col_names)}
+    table = pa.table(columns)
+
+    buf = io.BytesIO()
+    pq.write_table(table, buf, compression="snappy")
+    buf.seek(0)
+
+    return send_file(
+        buf,
+        mimetype="application/vnd.apache.parquet",
+        as_attachment=True,
+        download_name="shipments_full.parquet",
+    )
 
 
 # ─── Travel Endpoints ──────────────────────────────────────────────────────────
@@ -2364,5 +2433,6 @@ if __name__ == "__main__":
     print(f"  Running at: http://localhost:{port}")
     print(f"  UI:         http://localhost:{port}/")
     print(f"  Power BI:   http://localhost:{port}/api/logistics/shipments_full")
+    print(f"  Parquet:    http://localhost:{port}/api/logistics/shipments_full.parquet")
     print(f"{'='*60}\n")
     app.run(host="0.0.0.0", port=port, debug=False)

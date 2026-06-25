@@ -159,6 +159,12 @@ Primary Power BI endpoint (one row per container, all 49+ columns flat):
 http://localhost:7845/api/logistics/shipments_full
 ```
 
+For large datasets, the same view is available as a single Apache Parquet file —
+~10× faster ingest into Power BI / pandas than paging through JSON:
+```
+http://localhost:7845/api/logistics/shipments_full.parquet
+```
+
 Full endpoint catalog and Power BI connection recipe: [API reference](docs/06-API-REFERENCE.md).
 
 ---
@@ -175,13 +181,13 @@ glance:
 - Travel: Dashboard / Upload / Persons / Families / Documents
 - LLM config modal (4 providers, live model discovery, persisted)
 - 31-theme picker (synthwave default, persisted via localStorage)
+- Apache Parquet BI export (`/api/logistics/shipments_full.parquet`)
 - This wiki
 
 ### Now (in progress)
 
 ### Next (Q3 2026)
 - Job tracker persistence (resumable uploads after restart)
-- Apache Parquet export endpoint (10× faster Power BI ingest at scale)
 - Computed BI columns moved into a SQL VIEW (cleaner architecture)
 - Demurrage risk computation endpoint (`/api/logistics/risk/demurrage`)
 - Optional cloud LLM fallback (premium accuracy tier)
