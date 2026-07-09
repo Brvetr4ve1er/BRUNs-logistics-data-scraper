@@ -36,13 +36,32 @@ DEFAULT_FREE_DAYS: dict[str, int] = {
 
 # CMA-CGM tiered demurrage rates from real BL CFA0869742 (USD/day per size).
 # Each tuple is (start_day, end_day, rate_20ft, rate_40ft).
+#
+# CONVENTION: brackets are expressed in DAYS-OVER-FREE units (free days already
+# subtracted), NOT absolute days-at-port. calc_demurrage() is always called with
+# days_over_free, and free_days varies per carrier (CMA-CGM=15, MSC=14,
+# Maersk=12), so embedding a fixed 15-day free period in the brackets would be
+# wrong for every other carrier. The original BL table was absolute (16-45,
+# 46-60, 61-90, 91-999 days-at-port); it is remapped here by subtracting the
+# CMA-CGM 15 free days so day 1 over free maps to the first chargeable bracket:
+#   abs 16-45  -> over-free 1-30
+#   abs 46-60  -> over-free 31-45
+#   abs 61-90  -> over-free 46-75
+#   abs 91-999 -> over-free 76-984
+# $/day rates are unchanged.
 CMA_CGM_TIERS: list[tuple[int, int, float, float]] = [
-    (16, 45,  20.0,  40.0),   # days 16-45: $20/20ft, $40/40ft
-    (46, 60,  40.0,  80.0),   # days 46-60: $40/20ft, $80/40ft
-    (61, 90,  60.0, 110.0),   # days 61-90: $60/20ft, $110/40ft
-    (91, 999, 80.0, 140.0),   # days 91+:  $80/20ft, $140/40ft
+    (1,  30,  20.0,  40.0),   # 1-30 days over free:  $20/20ft, $40/40ft
+    (31, 45,  40.0,  80.0),   # 31-45 days over free: $40/20ft, $80/40ft
+    (46, 75,  60.0, 110.0),   # 46-75 days over free: $60/20ft, $110/40ft
+    (76, 984, 80.0, 140.0),   # 76+ days over free:   $80/20ft, $140/40ft
 ]
 DEFAULT_TIERS = CMA_CGM_TIERS  # fallback for other carriers
+
+# Business policy constants (promoted from inline magic numbers).
+DEFAULT_USD_TO_DZD = 135.0      # default exchange rate when none recorded
+RISK_DAYS_CRITICAL = 30         # days_over_free > this => critical
+RISK_DAYS_HIGH = 14             # days_over_free > this => high
+RISK_DAYS_LOW_REMAINING = 3     # days_remaining <= this (and not over) => low
 
 
 def calc_demurrage(days_over_free: int, container_size: str,
@@ -127,12 +146,13 @@ def demurrage_info(container: dict, shipment: dict) -> dict:
         }
 
     # End date: earliest of actual restitution, delivery, or today.
+    # Fold min() over BOTH dates — a later restitution must not hide an earlier
+    # delivery. Per-date try/except so one bad string doesn't drop the other.
     end_date = date.today()
     for d_str in (date_restitution, date_livraison):
         if d_str:
             try:
                 end_date = min(end_date, date.fromisoformat(d_str))
-                break
             except ValueError:
                 pass
 
@@ -140,19 +160,19 @@ def demurrage_info(container: dict, shipment: dict) -> dict:
     days_over_free = max(0, days_at_port - free_days)
     days_remaining = free_days - days_at_port  # negative = already over
 
-    taux = float(container.get("taux_de_change") or 0) or 135.0  # default DZD/USD
+    taux = float(container.get("taux_de_change") or 0) or DEFAULT_USD_TO_DZD
     size = container.get("size") or ""
     cost_usd = calc_demurrage(days_over_free, size)
     cost_dzd = round(cost_usd * taux, 0)
 
     # Risk level — same buckets used by the dashboard action panel.
-    if days_over_free > 30:
+    if days_over_free > RISK_DAYS_CRITICAL:
         risk_level = "critical"
-    elif days_over_free > 14:
+    elif days_over_free > RISK_DAYS_HIGH:
         risk_level = "high"
     elif days_over_free > 0:
         risk_level = "medium"
-    elif days_remaining <= 3:
+    elif days_remaining <= RISK_DAYS_LOW_REMAINING:
         risk_level = "low"
     else:
         risk_level = "none"
@@ -189,12 +209,17 @@ def free_days_from_documents(db_path: str, tan: str | None) -> int | None:
         return None
     conn = get_connection(db_path)
     try:
-        # LIKE filter narrows the scan to docs that even mention free_days.
+        # Push the TAN into SQL so we never silently skip a matching doc that
+        # falls outside an arbitrary recent-N window. The LIKE filters still
+        # narrow the scan to logistics docs that mention free_days AND this TAN;
+        # the Python guard below keeps an exact tan_number match.
         rows = conn.execute(
             """SELECT extracted_json FROM documents
                WHERE module = 'logistics'
                  AND extracted_json LIKE '%free_days%'
-               ORDER BY id DESC LIMIT 20""",
+                 AND extracted_json LIKE ?
+               ORDER BY id DESC""",
+            (f'%"tan_number": "{tan}"%',),
         ).fetchall()
     finally:
         conn.close()

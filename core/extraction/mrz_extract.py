@@ -153,14 +153,24 @@ def _try_all_rotations(pil_image, min_score: int = 0):
     return None, None
 
 
-def _yymmdd_to_iso(yymmdd: str, *, future_window_years: int = 10) -> Optional[str]:
+def _yymmdd_to_iso(
+    yymmdd: str,
+    *,
+    role: str = "expiry",
+    future_window_years: int = 10,
+    today: Optional[date] = None,
+) -> Optional[str]:
     """Convert MRZ-style YYMMDD to ISO YYYY-MM-DD.
 
-    Heuristic for the 2-digit year:
-      - If the year resolves to a date >10 years in the future, treat it as 19YY (DOB).
-      - Otherwise treat it as 20YY (covers issue/expiry dates).
+    The 2-digit year is disambiguated using the field's semantic role:
+      - role="dob": a date of birth must be in the past, so 20YY is only
+        chosen when it does not land in the future; otherwise 19YY.
+      - role="expiry"/"issue": dates may be in the future, so prefer 20YY
+        unless it lands implausibly far ahead (> future_window_years), in
+        which case fall back to 19YY.
 
-    Returns None if the input doesn't parse cleanly.
+    `today` is injectable for deterministic testing. Returns None if the
+    input doesn't parse cleanly.
     """
     if not yymmdd or len(yymmdd) != 6 or not yymmdd.isdigit():
         return None
@@ -170,9 +180,16 @@ def _yymmdd_to_iso(yymmdd: str, *, future_window_years: int = 10) -> Optional[st
         dd = int(yymmdd[4:6])
         if not (1 <= mm <= 12 and 1 <= dd <= 31):
             return None
-        # Try 20YY first, then 19YY based on a "future window" cutoff
+        ref = today or date.today()
         candidate_2k = date(2000 + yy, mm, dd)
-        cutoff = date.today() + timedelta(days=365 * future_window_years)
+        if role == "dob":
+            # A DOB cannot be in the future: if 20YY is still ahead of today,
+            # the person must have been born in the 1900s.
+            if candidate_2k > ref:
+                return f"19{yy:02d}-{mm:02d}-{dd:02d}"
+            return f"20{yy:02d}-{mm:02d}-{dd:02d}"
+        # expiry/issue: future is allowed, but cap the plausible range.
+        cutoff = ref + timedelta(days=365 * future_window_years)
         if candidate_2k > cutoff:
             return f"19{yy:02d}-{mm:02d}-{dd:02d}"
         return f"20{yy:02d}-{mm:02d}-{dd:02d}"
@@ -200,14 +217,18 @@ def _clean_name(s: str | None) -> Optional[str]:
     """
     if not s:
         return None
-    cleaned = s.replace("<", " ").strip()
-    cleaned = re.sub(r"\s+", " ", cleaned)
-    # Drop any standalone "word" of 1-15 chars made of MRZ-filler letters only.
-    # Real human names almost never consist purely of K/X/G/C/E for >2 chars.
-    cleaned = re.sub(r"\b[KXGCE]{1,15}\b", " ", cleaned)
-    cleaned = re.sub(r"\s+", " ", cleaned).strip()
-    # Final pass: strip trailing K/X runs (sometimes attached to last name)
-    cleaned = re.sub(r"\b[KX]{2,}\b\s*$", "", cleaned).strip()
+    tokens = s.replace("<", " ").split()
+    # Drop only tokens that look like MRZ filler: 2-4 chars made ENTIRELY of the
+    # filler letters Tesseract confuses `<` with. Bounding the length to 2-4
+    # (per this function's contract) protects legitimate names — a single-char
+    # initial is kept, and a 5+ char token is assumed real. As a safety net we
+    # never strip every token: if the filter would empty the name, keep the
+    # originals so a real name made of these letters isn't destroyed.
+    _FILLER = set("KXGCE")
+    kept = [t for t in tokens if not (2 <= len(t) <= 4 and set(t) <= _FILLER)]
+    if not kept:
+        kept = tokens
+    cleaned = " ".join(kept).strip()
     return cleaned or None
 
 
@@ -227,7 +248,7 @@ def _build_canonical(raw: dict, rotation: int = 0) -> Optional[dict]:
         "surname":          _clean_name(raw.get("surname")),
         "given_names":      _clean_name(raw.get("names")),
         "full_name":        _build_full_name(raw.get("surname"), raw.get("names")),
-        "dob":              _yymmdd_to_iso(raw.get("date_of_birth", "")),
+        "dob":              _yymmdd_to_iso(raw.get("date_of_birth", ""), role="dob"),
         "sex":              _normalize_sex(raw.get("sex")),
         "nationality":      _normalize_country(raw.get("nationality")),
         "expiry_date":      _yymmdd_to_iso(raw.get("expiration_date", "")),

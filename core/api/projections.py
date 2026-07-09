@@ -25,16 +25,11 @@ import json
 import os
 import sqlite3
 
+from core.normalization import name_normalize
 from core.storage.db import get_connection
 
 
 # ─── Travel projection ─────────────────────────────────────────────────────────
-def _norm_name(name: str | None) -> str:
-    if not name:
-        return ""
-    return " ".join(name.strip().lower().split())
-
-
 def _project_travel(conn: sqlite3.Connection, doc_id: int, d: dict) -> dict:
     """Project a travel-document extraction into persons + documents_travel.
 
@@ -72,7 +67,7 @@ def _project_travel(conn: sqlite3.Connection, doc_id: int, d: dict) -> dict:
     dob = (d.get("dob") or "").strip() or None
     nationality = (d.get("nationality") or "").strip() or None
     gender = (d.get("gender") or d.get("sex") or "").strip() or None
-    normalized = _norm_name(full_name)
+    normalized = name_normalize(full_name)
 
     # ── TD5 wire: fuzzy identity resolution ────────────────────────────────
     # Replace exact-string matching with the RapidFuzz-based engine. It
@@ -91,6 +86,7 @@ def _project_travel(conn: sqlite3.Connection, doc_id: int, d: dict) -> dict:
     person_id = None
     match_status = None
     match_score = None
+    inserted_person = 0
 
     if normalized:
         try:
@@ -134,15 +130,25 @@ def _project_travel(conn: sqlite3.Connection, doc_id: int, d: dict) -> dict:
             if result.status == "AUTO_MERGED" and result.matched_person_id:
                 person_id = result.matched_person_id
             elif result.status == "REVIEW" and result.matched_person_id:
-                # Probable match — reuse the candidate to avoid duplicates,
-                # but record the pair for human review.
-                person_id = result.matched_person_id
+                # Probable match, but uncertain. Insert the incoming identity as
+                # its own person row first so the `matches` row can capture BOTH
+                # sides of the pair (entity_a = new identity, entity_b = matched
+                # candidate). This keeps the incoming document attached to a
+                # distinct row that an operator can confirm/merge or split later,
+                # rather than silently folding it into the matched candidate.
+                cur = conn.execute(
+                    """INSERT INTO persons (full_name, normalized_name, dob, nationality, gender)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    (full_name, normalized or None, dob, nationality, gender),
+                )
+                person_id = cur.lastrowid
+                inserted_person = 1
                 try:
                     conn.execute(
                         """INSERT INTO matches
                               (entity_a_id, entity_b_id, score, status)
-                           VALUES (NULL, ?, ?, 'PENDING')""",
-                        (result.matched_person_id, float(result.score)),
+                           VALUES (?, ?, ?, 'PENDING')""",
+                        (person_id, result.matched_person_id, float(result.score)),
                     )
                 except Exception:
                     # matches table missing or column mismatch — non-fatal
@@ -164,7 +170,6 @@ def _project_travel(conn: sqlite3.Connection, doc_id: int, d: dict) -> dict:
             if row:
                 person_id = row[0]
 
-    inserted_person = 0
     if person_id is None:
         cur = conn.execute(
             """INSERT INTO persons (full_name, normalized_name, dob, nationality, gender)
@@ -182,13 +187,34 @@ def _project_travel(conn: sqlite3.Connection, doc_id: int, d: dict) -> dict:
     mrz2 = d.get("mrz_line_2") or ""
     mrz_raw = (mrz1 + ("\n" if mrz1 and mrz2 else "") + mrz2) or None
 
-    conn.execute(
-        """INSERT INTO documents_travel
-                (person_id, family_id, doc_type, doc_number, expiry_date, mrz_raw, original_doc_id)
-           VALUES (?, NULL, ?, ?, ?, ?, ?)""",
-        (person_id, doc_type, doc_number, expiry, mrz_raw, doc_id),
-    )
-    out = {"persons_inserted": inserted_person, "docs_inserted": 1, "person_id": person_id}
+    # ── Idempotency guard (mirrors the logistics container guard) ──
+    # Re-uploading the same document must not create a duplicate
+    # documents_travel row. Key on a stable identity:
+    #   (person_id, doc_type, doc_number) when a doc_number is present,
+    #   otherwise fall back to the originating document id.
+    if doc_number:
+        existing = conn.execute(
+            """SELECT id FROM documents_travel
+               WHERE person_id = ? AND doc_type = ? AND doc_number = ?""",
+            (person_id, doc_type, doc_number),
+        ).fetchone()
+    else:
+        existing = conn.execute(
+            "SELECT id FROM documents_travel WHERE original_doc_id = ?",
+            (doc_id,),
+        ).fetchone()
+
+    inserted_doc = 0
+    if existing is None:
+        conn.execute(
+            """INSERT INTO documents_travel
+                    (person_id, family_id, doc_type, doc_number, expiry_date, mrz_raw, original_doc_id)
+               VALUES (?, NULL, ?, ?, ?, ?, ?)""",
+            (person_id, doc_type, doc_number, expiry, mrz_raw, doc_id),
+        )
+        inserted_doc = 1
+
+    out = {"persons_inserted": inserted_person, "docs_inserted": inserted_doc, "person_id": person_id}
     if mrz_summary:
         out["mrz"] = mrz_summary
     if match_status:

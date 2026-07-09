@@ -60,6 +60,24 @@ except Exception as _e:
 app = Flask(__name__)
 app.config["JSON_AS_ASCII"] = False   # serve French chars as UTF-8, not \uXXXX escapes
 
+# Cap total request body size to bound upload DoS / disk exhaustion. Werkzeug
+# raises 413 (RequestEntityTooLarge) before the upload handler runs once the
+# stream exceeds this. Configurable via BRUNS_MAX_UPLOAD_MB (default 50 MB).
+try:
+    _max_upload_mb = int(os.environ.get("BRUNS_MAX_UPLOAD_MB", "50") or "50")
+except ValueError:
+    _max_upload_mb = 50
+app.config["MAX_CONTENT_LENGTH"] = _max_upload_mb * 1024 * 1024
+
+
+@app.errorhandler(413)
+def _handle_request_too_large(_e):
+    """Render a clean HTMX fragment instead of a raw 413 traceback."""
+    return render_template(
+        "logistics/_upload_error.html",
+        error=f"Upload too large (max {_max_upload_mb} MB).",
+    ), 413
+
 # TD9 fix: restrict CORS to localhost origins. Power BI Desktop hits the
 # REST endpoints from the same machine, so localhost / 127.0.0.1 covers the
 # real-world use case. If a customer needs to read these endpoints from
@@ -69,13 +87,24 @@ app.config["JSON_AS_ASCII"] = False   # serve French chars as UTF-8, not \uXXXX 
 # flask_cors accepts a list of regex pattern strings; it does NOT correctly
 # filter when given compiled re.Pattern objects mixed with strings, so we
 # stay with strings.
+# flask_cors compiles these with re.compile(...) and matches via pattern.match(),
+# which anchors only at the START. Without a trailing \Z an attacker host whose
+# name merely begins with localhost/127.0.0.1 (e.g. http://localhost.evil.com)
+# would be reflected back. Anchor every pattern at both ends.
 _default_cors_origins = [
-    r"http://localhost(:\d+)?",
-    r"http://127\.0\.0\.1(:\d+)?",
+    r"http://localhost(:\d+)?\Z",
+    r"http://127\.0\.0\.1(:\d+)?\Z",
 ]
 _cors_env = os.environ.get("BRUNS_CORS_ORIGINS", "").strip()
 if _cors_env:
-    _cors_origins: list = [o.strip() for o in _cors_env.split(",") if o.strip()]
+    # Env-supplied origins are also treated as unanchored regex by flask_cors,
+    # so escape them to exact literals and anchor at both ends. This makes each
+    # entry an exact-match origin (the intended semantics of an allowlist).
+    import re as _re_cors
+    _cors_origins: list = [
+        _re_cors.escape(o.strip()) + r"\Z"
+        for o in _cors_env.split(",") if o.strip()
+    ]
 else:
     _cors_origins = _default_cors_origins
 CORS(app, resources={r"/api/*": {"origins": _cors_origins}})
@@ -300,7 +329,7 @@ def logistics_shipments_full_parquet():
         abort(404, "logistics database not found")
 
     try:
-        import io
+        import tempfile
         import pyarrow as pa
         import pyarrow.parquet as pq
     except ImportError:
@@ -308,32 +337,58 @@ def logistics_shipments_full_parquet():
         # returns a clear error instead of a 500 traceback.
         abort(503, "pyarrow is required for Parquet export — run: pip install pyarrow")
 
+    # Stream the (unbounded) JOIN to a temp file in fixed-size batches instead of
+    # materializing every row + a transposed copy + the whole compressed buffer in
+    # memory at once. pq.ParquetWriter flushes each RecordBatch incrementally.
+    _BATCH_SIZE = 5000
+    tmp = tempfile.NamedTemporaryFile(suffix=".parquet", delete=False)
+    tmp_path = tmp.name
+    tmp.close()
+
     conn = get_connection(LOGISTICS_DB)
+    writer = None
     try:
         where_sql, params = _shipments_full_where()
         cursor = conn.execute(_SHIPMENTS_FULL_SELECT.format(where_sql=where_sql), params)
-        # Pull column names from the cursor so the schema is correct even when
-        # the result set is empty (rows[0] would be unavailable).
         col_names = [d[0] for d in cursor.description]
-        rows = cursor.fetchall()
+
+        while True:
+            chunk = cursor.fetchmany(_BATCH_SIZE)
+            if not chunk:
+                break
+            columns = {name: [row[i] for row in chunk] for i, name in enumerate(col_names)}
+            batch_table = pa.table(columns)
+            if writer is None:
+                writer = pq.ParquetWriter(tmp_path, batch_table.schema, compression="snappy")
+            writer.write_table(batch_table)
+
+        if writer is None:
+            # Empty result set — still emit a valid file with the correct schema.
+            empty = pa.table({name: [] for name in col_names})
+            writer = pq.ParquetWriter(tmp_path, empty.schema, compression="snappy")
+            writer.write_table(empty)
     finally:
+        if writer is not None:
+            writer.close()
         conn.close()
 
-    # Build a columnar pyarrow Table directly from the rows. pyarrow infers each
-    # column's type from its values and tolerates NULLs mixed with strings/ints.
-    columns = {name: [row[i] for row in rows] for i, name in enumerate(col_names)}
-    table = pa.table(columns)
-
-    buf = io.BytesIO()
-    pq.write_table(table, buf, compression="snappy")
-    buf.seek(0)
-
-    return send_file(
-        buf,
+    resp = send_file(
+        tmp_path,
         mimetype="application/vnd.apache.parquet",
         as_attachment=True,
         download_name="shipments_full.parquet",
     )
+
+    # Delete the temp file once the response has been fully streamed, so the
+    # spooled Parquet files don't accumulate on disk across requests.
+    @resp.call_on_close
+    def _cleanup_tmp():
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+    return resp
 
 
 # ─── Travel Endpoints ──────────────────────────────────────────────────────────
@@ -860,6 +915,9 @@ def ui_logistics_ask():
     if not question:
         return render_template("logistics/_ask_result.html",
                                error="Empty question.", rows=[], cols=[], sql="")
+    if len(question) > 2000:
+        return render_template("logistics/_ask_result.html",
+                               error="Question too long.", rows=[], cols=[], sql="")
 
     # 1. LLM call
     try:
@@ -948,7 +1006,10 @@ def ui_serve_annotated(module: str, doc_id: int):
     except ImportError:
         abort(500, "PyMuPDF not installed")
 
-    page_num = max(0, int(request.args.get("page", 0)))
+    try:
+        page_num = max(0, int(request.args.get("page", 0)))
+    except (TypeError, ValueError):
+        abort(400, "page must be an integer")
     active_field = request.args.get("field", None)
 
     try:
@@ -956,45 +1017,50 @@ def ui_serve_annotated(module: str, doc_id: int):
     except Exception as e:
         abort(500, f"Cannot open PDF: {e}")
 
-    if page_num >= len(doc):
-        page_num = 0
-    page = doc[page_num]
+    # Everything below holds a native MuPDF document handle (+ mmap'd file).
+    # Wrap it in try/finally so a raising get_pixmap/tobytes/highlight call can
+    # never leak the handle — this route is polled per field/page from the UI.
+    try:
+        if page_num >= len(doc):
+            page_num = 0
+        page = doc[page_num]
 
-    # Collect (value, color) pairs to highlight
-    flat = _flatten_diff(extracted)
-    highlights = []
+        # Collect (value, color) pairs to highlight
+        flat = _flatten_diff(extracted)
+        highlights = []
 
-    for field_path, value in flat.items():
-        if value is None or value == "" or isinstance(value, bool):
-            continue
-        # Only highlight the active field if one is specified
-        if active_field and field_path != active_field:
-            continue
-        val_str = str(value).strip()
-        if len(val_str) < 3:
-            continue
-        color = _field_color(field_path)
-        # Boost opacity if this is the active field
-        alpha = 0.7 if (active_field and field_path == active_field) else 0.35
-        highlights.append((val_str, color, alpha))
+        for field_path, value in flat.items():
+            if value is None or value == "" or isinstance(value, bool):
+                continue
+            # Only highlight the active field if one is specified
+            if active_field and field_path != active_field:
+                continue
+            val_str = str(value).strip()
+            if len(val_str) < 3:
+                continue
+            color = _field_color(field_path)
+            # Boost opacity if this is the active field
+            alpha = 0.7 if (active_field and field_path == active_field) else 0.35
+            highlights.append((val_str, color, alpha))
 
-    # Apply highlights: search for each value, add annotation
-    for val_str, color, alpha in highlights:
-        try:
-            instances = page.search_for(val_str, quads=True)
-            for inst in instances:
-                ann = page.add_highlight_annot(inst)
-                ann.set_colors(stroke=color)
-                ann.set_opacity(alpha)
-                ann.update()
-        except Exception:
-            continue
+        # Apply highlights: search for each value, add annotation
+        for val_str, color, alpha in highlights:
+            try:
+                instances = page.search_for(val_str, quads=True)
+                for inst in instances:
+                    ann = page.add_highlight_annot(inst)
+                    ann.set_colors(stroke=color)
+                    ann.set_opacity(alpha)
+                    ann.update()
+            except Exception:
+                continue
 
-    # Render annotated page to PNG
-    mat = fitz.Matrix(2.0, 2.0)  # 144 DPI — crisp on retina, reasonable file size
-    pix = page.get_pixmap(matrix=mat, alpha=False)
-    png_bytes = pix.tobytes("png")
-    doc.close()
+        # Render annotated page to PNG
+        mat = fitz.Matrix(2.0, 2.0)  # 144 DPI — crisp on retina, reasonable file size
+        pix = page.get_pixmap(matrix=mat, alpha=False)
+        png_bytes = pix.tobytes("png")
+    finally:
+        doc.close()
 
     from flask import Response as FlaskResponse
     return FlaskResponse(png_bytes, mimetype="image/png",
