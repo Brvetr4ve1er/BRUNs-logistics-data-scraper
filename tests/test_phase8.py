@@ -46,7 +46,18 @@ print('   Compresses to .csv.gz + VACUUM. PASS')
 
 print()
 print('[4] Testing REST API server...')
-from core.api.server import app
+import tempfile as _tempfile
+from core.storage.db import init_schema as _init_schema
+from core.api import server as _srv
+# Point the server at freshly-initialised temp DBs so the endpoints return
+# well-formed pagination. Without an existing DB the endpoints short-circuit to
+# {"data": [], "pagination": {}} and this script crashed with a KeyError at
+# collection time. Reassigning the module globals works regardless of whether
+# another test already imported the server.
+_tmpdir = _tempfile.mkdtemp()
+_srv.LOGISTICS_DB = os.path.join(_tmpdir, 'logistics.db'); _init_schema(_srv.LOGISTICS_DB)
+_srv.TRAVEL_DB = os.path.join(_tmpdir, 'travel.db'); _init_schema(_srv.TRAVEL_DB)
+app = _srv.app
 client = app.test_client()
 resp  = client.get('/api/status')
 assert resp.status_code == 200

@@ -4,7 +4,7 @@ def export_to_xlsx(db_path: str, output_path: str, columns_config: list):
     """
     Export database to XLSX using the new architecture.
     """
-    from .db import get_connection
+    from ..db import get_connection
     conn = get_connection(db_path)
     try:
         # Load data (this query will be adjusted based on the module)
