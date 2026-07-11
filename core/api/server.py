@@ -21,6 +21,7 @@ Start with:
     python core/api/server.py
 """
 
+import functools
 import json
 import logging
 import os
@@ -1233,7 +1234,12 @@ def ui_travel_person_update(person_id: int):
         "nationality": (request.form.get("nationality") or "").strip() or None,
         "gender":      (request.form.get("gender") or "").strip() or None,
     }
-    normalized = (fields["full_name"] or "").lower().strip() or None
+    # Use the same canonical normalizer the projection layer uses, so an edited
+    # person row stays matchable against projected rows (whitespace-collapse +
+    # accent-strip). A divergent inline `.lower().strip()` here silently broke
+    # dedup between edited and imported identities.
+    from core.normalization import name_normalize
+    normalized = name_normalize(fields["full_name"]) or None
     conn = get_connection(TRAVEL_DB)
     try:
         conn.execute(
@@ -1367,9 +1373,46 @@ def ui_llm_config_form():
     )
 
 
+def _validate_llm_target(cfg: dict) -> tuple[bool, str]:
+    """Guard the configured LLM endpoint against SSRF to link-local/metadata.
+
+    The /llm/* endpoints will fetch whatever base_url/port the form supplies, so
+    a malicious page in the same browser could point them at a cloud metadata
+    service (169.254.169.254) or other link-local host. Require an http(s)
+    scheme and reject link-local ranges. Localhost and private LAN are allowed
+    on purpose — Ollama/LM Studio legitimately run there.
+    """
+    import ipaddress
+    import socket
+    from urllib.parse import urlparse
+
+    raw = str(cfg.get("base_url") or "").strip()
+    parsed = urlparse(raw if "://" in raw else f"http://{raw}")
+    if parsed.scheme not in ("http", "https"):
+        return False, f"Unsupported URL scheme: {parsed.scheme or '(none)'}"
+    host = parsed.hostname
+    if not host:
+        return False, "Missing host in base_url"
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except socket.gaierror:
+        return False, f"Cannot resolve host: {host}"
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0])
+        if ip.is_link_local:   # 169.254.0.0/16, fe80::/10 — incl. cloud metadata
+            return False, f"Refusing to connect to link-local address {ip}"
+    return True, ""
+
+
 @app.route("/llm/test", methods=["POST"])
 def ui_llm_test_connection():
     cfg = _llm_cfg_from_form(request.form)
+    ok_host, host_msg = _validate_llm_target(cfg)
+    if not ok_host:
+        return render_template(
+            "llm/_modal_form.html", cfg=cfg, providers=llm_config.PROVIDERS,
+            models=[], status={"ok": False, "msg": host_msg},
+        )
     ok, msg, models = llm_config.test_connection(cfg)
     return render_template(
         "llm/_modal_form.html",
@@ -1383,6 +1426,12 @@ def ui_llm_test_connection():
 @app.route("/llm/save", methods=["POST"])
 def ui_llm_save():
     cfg = _llm_cfg_from_form(request.form)
+    ok_host, host_msg = _validate_llm_target(cfg)
+    if not ok_host:
+        return render_template(
+            "llm/_modal_form.html", cfg=cfg, providers=llm_config.PROVIDERS,
+            models=[], status={"ok": False, "msg": host_msg},
+        )
     try:
         llm_config.save_config(cfg)
         return render_template(
@@ -1500,7 +1549,7 @@ EDITABLE_FIELDS = {
     "date_restitution_estimative": "date",
     "nbr_jours_surestarie_estimes": "number",
     "nbr_jour_surestarie_facture":  "number",
-    "montant_facture_check":   "number",
+    "montant_facture_check":   "text",   # DDL column is TEXT ('Yes'/'No'), not numeric
     "montant_facture_da":      "number",
     "taux_de_change":          "number",
     "n_facture_cm":            "text",
@@ -1547,16 +1596,31 @@ def _semantic_search_ids(q: str, module: str, n: int = 50) -> list[int]:
     back to LIKE matching.
     """
     try:
-        from core.search.vector_db import VectorSearchEngine
         vector_dir = os.path.join(DATA_DIR, "vector")
         if not os.path.isdir(vector_dir):
             return []
-        engine = VectorSearchEngine(vector_dir)
+        engine = _get_vector_engine(vector_dir)
+        if engine is None:
+            return []
         hits = engine.search(q, module=module, n_results=n)
         return [h["document_id"] for h in hits if h.get("document_id") is not None]
     except Exception as e:
         log.warning("semantic search fallback to LIKE matching: %s", e)
         return []
+
+
+@functools.lru_cache(maxsize=4)
+def _get_vector_engine(vector_dir: str):
+    """Reuse one VectorSearchEngine (and its ChromaDB PersistentClient) per
+    vector dir. Instantiating a PersistentClient per request re-opens the
+    on-disk index and its embedding model every time — expensive and leak-prone.
+    Returns None if ChromaDB isn't available."""
+    try:
+        from core.search.vector_db import VectorSearchEngine
+        return VectorSearchEngine(vector_dir)
+    except Exception as e:
+        log.warning("vector engine unavailable: %s", e)
+        return None
 
 
 @app.route("/logistics/documents")
@@ -1827,9 +1891,11 @@ def ui_logistics_document_reextract(doc_id: int):
     try:
         file_hash = _file_sha256(source)
         c2 = get_connection(LOGISTICS_DB)
-        c2.execute("DELETE FROM extraction_cache WHERE file_hash = ?", (file_hash,))
-        c2.commit()
-        c2.close()
+        try:
+            c2.execute("DELETE FROM extraction_cache WHERE file_hash = ?", (file_hash,))
+            c2.commit()
+        finally:
+            c2.close()
     except Exception as e:
         return render_template("logistics/_reextract_diff.html",
                                ok=False, error=f"Cache clear failed: {e}", doc_id=doc_id)

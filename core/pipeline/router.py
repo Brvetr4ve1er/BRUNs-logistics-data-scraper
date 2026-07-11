@@ -72,8 +72,12 @@ def route_file(file_path: str, module: str, doc_type: str = "UNKNOWN"):
     cfg = _resolve_llm_settings()
 
     from ..storage.db import init_schema
+    from ..storage.migrations import run_migrations
     if not os.path.exists(db_path):
         init_schema(db_path)
+    # Always run migrations — a DB created here mid-session (rather than at
+    # startup) would otherwise never get the 004+ dashboard/tan indexes.
+    run_migrations(db_path)
 
     llm_client = LLMClient(
         ollama_url=cfg["generate_url"],

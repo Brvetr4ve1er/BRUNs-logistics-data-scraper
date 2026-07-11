@@ -33,17 +33,25 @@ _MAX_JOBS = 200
 
 
 def _purge_old_locked(max_age_seconds: int = 3600) -> None:
-    """Caller must hold _LOCK. Drop jobs older than `max_age_seconds`."""
+    """Caller must hold _LOCK. Drop TERMINATED jobs older than `max_age_seconds`.
+
+    A job is only eligible for purge once it has a completed_at timestamp — an
+    in-flight job that legitimately runs longer than max_age_seconds must not be
+    evicted mid-execution (that would strand the UI's status poller on a 404).
+    """
     cutoff = datetime.utcnow() - timedelta(seconds=max_age_seconds)
     stale = [jid for jid, j in _JOBS.items()
-             if (j.completed_at or j.created_at) < cutoff]
+             if j.completed_at is not None and j.completed_at < cutoff]
     for jid in stale:
         _JOBS.pop(jid, None)
-    # Hard cap — drop oldest if we're still over the limit
+    # Hard cap — if still over the limit, drop the oldest COMPLETED jobs only,
+    # never a running one.
     if len(_JOBS) > _MAX_JOBS:
-        ordered = sorted(_JOBS.items(),
-                         key=lambda kv: kv[1].completed_at or kv[1].created_at)
-        for jid, _ in ordered[: len(_JOBS) - _MAX_JOBS]:
+        completed = sorted(
+            ((jid, j) for jid, j in _JOBS.items() if j.completed_at is not None),
+            key=lambda kv: kv[1].completed_at,
+        )
+        for jid, _ in completed[: len(_JOBS) - _MAX_JOBS]:
             _JOBS.pop(jid, None)
 
 

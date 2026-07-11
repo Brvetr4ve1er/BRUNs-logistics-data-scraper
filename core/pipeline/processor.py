@@ -55,12 +55,25 @@ class PipelineProcessor:
                 (file_hash_hex,)
             ).fetchone()
             
+            cached_data = None
             if cached:
+                try:
+                    parsed = json.loads(cached["result_json"])
+                    if isinstance(parsed, dict):
+                        cached_data = parsed
+                except (json.JSONDecodeError, TypeError):
+                    cached_data = None  # corrupt cache row → fall through to re-extract
+
+            if cached_data is not None:
                 job.log("Cache hit — bypassing LLM extraction.")
-                extracted_data    = json.loads(cached['result_json'])
+                from core.extraction.llm_client import _confidence
+                extracted_data    = cached_data
                 full_text         = "Cached extraction"
                 doc_type_resolved = doc_type
-                confidence        = 1.0
+                # Recompute confidence from the cached payload instead of
+                # hardcoding 1.0 — a cached low-confidence result should still
+                # route to the review queue.
+                confidence        = _confidence(module, extracted_data)
             else:
                 # ── Step 1: Chunked Extraction (Map-Reduce) ──────────────────
                 is_pdf = file_path.lower().endswith(".pdf")

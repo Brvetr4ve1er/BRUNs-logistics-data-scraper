@@ -10,6 +10,7 @@ Strategy order:
 import io
 import logging
 import os
+from contextlib import closing
 import fitz  # PyMuPDF
 from PIL import Image
 
@@ -63,22 +64,23 @@ def extract_text(file_path: str) -> str:
         return ""
 
 def _extract_from_pdf(pdf_path: str) -> str:
-    doc = fitz.open(pdf_path)
     page_texts = []
 
-    for page_num, page in enumerate(doc):
-        text = page.get_text().strip()
+    # closing() releases the native MuPDF handle (and its mmap) even if a
+    # per-page get_text()/OCR call raises partway through the document.
+    with closing(fitz.open(pdf_path)) as doc:
+        for page_num, page in enumerate(doc):
+            text = page.get_text().strip()
 
-        if len(text) >= MIN_TEXT_CHARS:
-            # Strategy 1: embedded text — done
-            page_texts.append(text)
-        else:
-            # Page is image-only — try OCR
-            log.debug("page %d has no embedded text -> trying OCR", page_num + 1)
-            ocr_text = _ocr_page(page, page_num, pdf_path)
-            page_texts.append(ocr_text)
+            if len(text) >= MIN_TEXT_CHARS:
+                # Strategy 1: embedded text — done
+                page_texts.append(text)
+            else:
+                # Page is image-only — try OCR
+                log.debug("page %d has no embedded text -> trying OCR", page_num + 1)
+                ocr_text = _ocr_page(page, page_num, pdf_path)
+                page_texts.append(ocr_text)
 
-    doc.close()
     result = "\n".join(page_texts).strip()
 
     if result:
@@ -92,11 +94,9 @@ def _extract_from_image(image_path: str) -> str:
     """Extract text from a standalone image file using Tesseract or Vision."""
     log.info("processing image %s", os.path.basename(image_path))
     try:
-        doc = fitz.open(image_path)
-        page = doc[0]
-        text = _ocr_page(page, 0, image_path)
-        doc.close()
-        
+        with closing(fitz.open(image_path)) as doc:
+            text = _ocr_page(doc[0], 0, image_path)
+
         if text:
             log.info("extracted %d chars from image %s", len(text), os.path.basename(image_path))
         else:
@@ -110,9 +110,8 @@ def _extract_from_image(image_path: str) -> str:
 def is_image_pdf(pdf_path: str) -> bool:
     """Return True if the PDF appears to be entirely image-based (no embedded text)."""
     try:
-        doc = fitz.open(pdf_path)
-        total_text = "".join(page.get_text() for page in doc).strip()
-        doc.close()
+        with closing(fitz.open(pdf_path)) as doc:
+            total_text = "".join(page.get_text() for page in doc).strip()
         return len(total_text) < MIN_TEXT_CHARS
     except Exception:
         return True
@@ -163,21 +162,27 @@ def _ocr_with_tesseract(page: fitz.Page) -> str:
     pix = page.get_pixmap(matrix=mat, colorspace=fitz.csRGB)
     img_bytes = pix.tobytes("png")
 
-    img = Image.open(io.BytesIO(img_bytes))
-    try:
-        text = pytesseract.image_to_string(img, lang="fra+eng")
-    except Exception:
-        text = pytesseract.image_to_string(img)
-
-    text = (text or "").strip()
-    if _has_arabic(text) or len(text) < 40:
+    # Keep the PIL image open for both OCR passes, then release its buffer via
+    # the context manager regardless of which passes run or raise.
+    with Image.open(io.BytesIO(img_bytes)) as img:
         try:
-            text_ar = pytesseract.image_to_string(img, lang="ara+fra+eng")
-            if text_ar and (len(text_ar.strip()) > len(text) or _has_arabic(text_ar)):
-                log.info("Arabic detected -> ara+fra+eng OCR (%d chars)", len(text_ar))
-                return text_ar.strip()
+            text = pytesseract.image_to_string(img, lang="fra+eng")
         except Exception as e:
-            log.warning("Arabic OCR fallback failed: %s", e)
+            # A missing fra/eng traineddata (or a transient tesseract error)
+            # falls back to the default language — make the failure observable
+            # rather than silently degrading OCR quality.
+            log.warning("fra+eng OCR failed, retrying with default language: %s", e)
+            text = pytesseract.image_to_string(img)
+
+        text = (text or "").strip()
+        if _has_arabic(text) or len(text) < 40:
+            try:
+                text_ar = pytesseract.image_to_string(img, lang="ara+fra+eng")
+                if text_ar and (len(text_ar.strip()) > len(text) or _has_arabic(text_ar)):
+                    log.info("Arabic detected -> ara+fra+eng OCR (%d chars)", len(text_ar))
+                    return text_ar.strip()
+            except Exception as e:
+                log.warning("Arabic OCR fallback failed: %s", e)
 
     return text
 

@@ -58,6 +58,14 @@ MIGRATIONS: list[tuple[str, list[str]]] = [
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         )""",
     ]),
+    ("006_shipments_tan_index", [
+        # tan is the upsert key for every logistics projection and the lookup
+        # key for demurrage/free-days queries — index it. A UNIQUE index is a
+        # deliberate follow-up: it would fail on any pre-existing duplicate tan,
+        # and new duplicates are already prevented by the projection's
+        # find-by-tan-before-insert guard.
+        "CREATE INDEX IF NOT EXISTS idx_shipments_tan ON shipments(tan)",
+    ]),
 ]
 
 # Error fragments that mean "the change is already applied" — treat as success.
