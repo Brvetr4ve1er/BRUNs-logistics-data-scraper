@@ -891,6 +891,7 @@ def ui_serve_original_file(module: str, doc_id: int):
 from core.business.demurrage import (
     demurrage_info as _demurrage_info,
     free_days_from_documents as _free_days_from_documents,
+    free_days_map as _free_days_map,
 )
 from core.business.reconcile import (
     compute_diff as _compute_diff,
@@ -2245,14 +2246,11 @@ def ui_logistics_swimlane():
     if other:
         columns.setdefault("OTHER", []).extend(other)
 
-    # N5: build a TAN → free_days cache once so we don't open a connection
-    # per card. Empty cache when no TAN has document-extracted free_days.
+    # N5: build a TAN → free_days cache in ONE query so we don't open a
+    # connection + full-scan per card. Empty when no TAN has a
+    # document-extracted free_days value.
     distinct_tans = {c.get("tan") for stage in columns.values() for c in stage if c.get("tan")}
-    fd_cache: dict[str, int] = {}
-    for tan in distinct_tans:
-        fd = _free_days_from_documents(LOGISTICS_DB, tan)
-        if fd is not None:
-            fd_cache[tan] = fd
+    fd_cache = _free_days_map(LOGISTICS_DB, distinct_tans)
 
     # Compute D&D risk per card, using extracted free_days when available.
     for stage in list(columns.keys()):

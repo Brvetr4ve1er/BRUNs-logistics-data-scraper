@@ -240,3 +240,44 @@ def free_days_from_documents(db_path: str, tan: str | None) -> int | None:
             log.debug("free_days for %s not parseable: %r", tan, fd)
             continue
     return None
+
+
+def free_days_map(db_path: str, tans) -> dict[str, int]:
+    """Batch lookup of document-extracted free_days for many TANs in ONE query.
+
+    Equivalent to calling free_days_from_documents once per TAN, but avoids the
+    N+1 connection-per-TAN pattern in views that render many containers (e.g.
+    the swimlane). Returns {tan: free_days} only for TANs with a usable positive
+    value; TANs without one are simply absent so callers fall back to carrier
+    defaults. The most recent document wins (rows scanned newest-first).
+    """
+    wanted = {t for t in (tans or ()) if t}
+    if not wanted or not os.path.exists(db_path):
+        return {}
+    conn = get_connection(db_path)
+    try:
+        rows = conn.execute(
+            """SELECT extracted_json FROM documents
+               WHERE module = 'logistics' AND extracted_json LIKE '%free_days%'
+               ORDER BY id DESC"""
+        ).fetchall()
+    finally:
+        conn.close()
+
+    out: dict[str, int] = {}
+    for r in rows:
+        try:
+            ed = json.loads(r[0] or "{}")
+        except json.JSONDecodeError:
+            continue
+        tan = ed.get("tan_number")
+        if tan not in wanted or tan in out:  # keep first (newest) hit per TAN
+            continue
+        fd = ed.get("free_days")
+        try:
+            fd = int(fd)
+        except (ValueError, TypeError):
+            continue
+        if fd > 0:
+            out[tan] = fd
+    return out
