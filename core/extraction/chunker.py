@@ -14,6 +14,7 @@ Solution:
 
 import fitz
 import json
+from contextlib import closing
 from typing import Any
 
 # Overlap between chunks to avoid losing data that straddles a page boundary
@@ -22,12 +23,55 @@ OVERLAP_PAGES    = 1
 # If extracted text is shorter than this threshold, skip chunking entirely
 CHUNKING_THRESHOLD_CHARS = 3000
 
+# Keys that identify the same real-world list item across overlapping chunks.
+# Two container dicts with the same container_number are the same physical box
+# even if one chunk saw fewer fields — they must be merged, not duplicated.
+_LIST_IDENTITY_KEYS = ("container_number", "number")
+
+
+def _identity_key(item: Any):
+    """Return a stable identity for a list item, or None if it has no natural key."""
+    if isinstance(item, dict):
+        for k in _LIST_IDENTITY_KEYS:
+            v = item.get(k)
+            if v not in (None, ""):
+                return (k, str(v).strip().upper())
+    return None
+
+
+def _merge_lists(base_list: list, update_list: list) -> list:
+    """Combine two lists, folding items that share a natural identity key.
+
+    Items with the same identity (e.g. same container_number) are deep-merged
+    so a partial entry from an overlapping chunk enriches rather than duplicates
+    the existing one. Items without an identity key fall back to exact-JSON
+    dedup (the previous behaviour).
+    """
+    result: list = []
+    index: dict = {}       # identity -> position in result
+    seen_exact: set = set()
+    for item in base_list + update_list:
+        idk = _identity_key(item)
+        if idk is not None:
+            if idk in index:
+                result[index[idk]] = _merge_dicts(result[index[idk]], item)
+            else:
+                index[idk] = len(result)
+                result.append(item)
+        else:
+            token = json.dumps(item, sort_keys=True, default=str)
+            if token not in seen_exact:
+                seen_exact.add(token)
+                result.append(item)
+    return result
+
 
 def _merge_dicts(base: dict, update: dict) -> dict:
     """
     Deep-merge two dicts:
     - Strings/numbers: non-null value from `update` wins
-    - Lists: items are combined and deduplicated (order preserved)
+    - Lists: items are combined, folding list items that share an identity key
+      (e.g. container_number) and exact-deduping the rest
     """
     merged = dict(base)
     for key, val in update.items():
@@ -36,14 +80,7 @@ def _merge_dicts(base: dict, update: dict) -> dict:
         if key not in merged or merged[key] is None or merged[key] == "":
             merged[key] = val
         elif isinstance(val, list) and isinstance(merged[key], list):
-            seen = set()
-            combined = []
-            for item in merged[key] + val:
-                token = json.dumps(item, sort_keys=True)
-                if token not in seen:
-                    seen.add(token)
-                    combined.append(item)
-            merged[key] = combined
+            merged[key] = _merge_lists(merged[key], val)
         else:
             # Non-null update value wins (later chunks have more context)
             merged[key] = val
@@ -55,37 +92,36 @@ def chunk_pdf_text(pdf_path: str) -> list[dict[str, Any]]:
     Extract text per page-group from a PDF.
     Returns a list of chunk dicts: {"text": str, "pages": [int, ...]}
     """
-    doc = fitz.open(pdf_path)
-    total_pages = len(doc)
+    # closing() guarantees the native MuPDF handle (and its mmap'd file) is
+    # released even if get_text()/load_page() raises partway through.
+    with closing(fitz.open(pdf_path)) as doc:
+        total_pages = len(doc)
 
-    # For small documents, return a single chunk — no overhead
-    full_text = ""
-    for page in doc:
-        full_text += page.get_text()
-    doc.close()
+        # For small documents, return a single chunk — no overhead
+        full_text = ""
+        for page in doc:
+            full_text += page.get_text()
 
-    if len(full_text) < CHUNKING_THRESHOLD_CHARS:
-        return [{"text": full_text, "pages": list(range(1, total_pages + 1))}]
+        if len(full_text) < CHUNKING_THRESHOLD_CHARS:
+            return [{"text": full_text, "pages": list(range(1, total_pages + 1))}]
 
-    # Large document — chunk it
-    doc = fitz.open(pdf_path)
-    chunks = []
-    step = CHUNK_SIZE_PAGES - OVERLAP_PAGES
-    page_idx = 0
+        # Large document — chunk it
+        chunks = []
+        step = CHUNK_SIZE_PAGES - OVERLAP_PAGES
+        page_idx = 0
 
-    while page_idx < total_pages:
-        end_idx = min(page_idx + CHUNK_SIZE_PAGES, total_pages)
-        chunk_text = ""
-        page_nums = []
-        for i in range(page_idx, end_idx):
-            chunk_text += doc.load_page(i).get_text()
-            page_nums.append(i + 1)
-        if chunk_text.strip():
-            chunks.append({"text": chunk_text, "pages": page_nums})
-        page_idx += step
+        while page_idx < total_pages:
+            end_idx = min(page_idx + CHUNK_SIZE_PAGES, total_pages)
+            chunk_text = ""
+            page_nums = []
+            for i in range(page_idx, end_idx):
+                chunk_text += doc.load_page(i).get_text()
+                page_nums.append(i + 1)
+            if chunk_text.strip():
+                chunks.append({"text": chunk_text, "pages": page_nums})
+            page_idx += step
 
-    doc.close()
-    return chunks
+        return chunks
 
 
 def merge_chunk_results(chunk_results: list[dict]) -> dict:

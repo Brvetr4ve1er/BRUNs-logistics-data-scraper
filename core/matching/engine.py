@@ -1,7 +1,10 @@
 from typing import List, Dict, Tuple
 from pydantic import BaseModel
 from .scorers import score_names, score_dob, score_nationality
-from .thresholds import AUTO_MERGE_THRESHOLD, REVIEW_THRESHOLD
+from .thresholds import (
+    AUTO_MERGE_THRESHOLD, REVIEW_THRESHOLD,
+    WEIGHT_NAME, WEIGHT_DOB, WEIGHT_NATIONALITY,
+)
 from ..schemas.person import Person
 
 class MatchResult(BaseModel):
@@ -16,12 +19,7 @@ def calculate_similarity(person_a: Person, person_b: Person) -> Tuple[float, Dic
     dob_score = score_dob(person_a.dob, person_b.dob)
     nat_score = score_nationality(person_a.nationality, person_b.nationality)
     
-    # Weights
-    w_name = 0.6
-    w_dob = 0.3
-    w_nat = 0.1
-    
-    total_score = (name_score * w_name) + (dob_score * w_dob) + (nat_score * w_nat)
+    total_score = (name_score * WEIGHT_NAME) + (dob_score * WEIGHT_DOB) + (nat_score * WEIGHT_NATIONALITY)
     
     breakdown = {
         "name": name_score,

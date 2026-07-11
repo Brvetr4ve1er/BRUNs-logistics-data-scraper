@@ -9,20 +9,45 @@ Resilience features:
   - Cleans up markdown code fences if the LLM returns them anyway
 """
 import json
+import os
+import re
 import requests
 from datetime import datetime, timezone
 from .result import ExtractionResult
 from .prompt_registry import get_prompt
+from ..normalization.dates import date_normalize
 
 
 # Per-module "important fields" used to compute a confidence score.
-# A field is "filled" if it's present and not null/empty/empty-list/empty-dict.
+# A field counts toward confidence only if it is present AND passes a light
+# validity check (see _field_is_valid) — presence alone let obviously-garbage
+# values ("size": "999 m", an empty container list of [{}]) score as confident.
 _CONFIDENCE_FIELDS = {
     "logistics": ["tan_number", "vessel_name", "etd", "eta",
                   "shipping_company", "containers"],
     "travel":    ["document_type", "document_number", "full_name",
                   "dob", "nationality", "expiry_date"],
 }
+
+# Fields whose value must parse as a real date to count.
+_DATE_FIELDS = {"etd", "eta", "expiry_date", "dob"}
+
+
+def _field_is_valid(field: str, value) -> bool:
+    """Return True if `value` is a plausible value for `field` (not just present)."""
+    if value in (None, "", [], {}):
+        return False
+    if field == "containers":
+        # A list of empty dicts is not real container data.
+        if not isinstance(value, list):
+            return False
+        return any(
+            isinstance(c, dict) and str(c.get("container_number") or "").strip()
+            for c in value
+        )
+    if field in _DATE_FIELDS:
+        return date_normalize(value) is not None
+    return bool(str(value).strip())
 
 
 def _strip_code_fences(s: str) -> str:
@@ -43,11 +68,11 @@ def _strip_code_fences(s: str) -> str:
 def _confidence(module: str, data: dict) -> float:
     fields = _CONFIDENCE_FIELDS.get(module)
     if not fields:
-        # Unknown module — fall back to "any field is good"
+        # Unknown module — fall back to "any non-empty field is good"
         fields = list(data.keys()) or [""]
     if not fields:
         return 0.0
-    filled = sum(1 for f in fields if data.get(f) not in (None, "", [], {}))
+    filled = sum(1 for f in fields if _field_is_valid(f, data.get(f)))
     return round(filled / len(fields), 3)
 
 
@@ -59,12 +84,23 @@ class LLMClient:
     """
 
     def __init__(self, ollama_url: str, model: str, timeout: int = 120,
-                 temperature: float = 0.1, num_ctx: int = 8192):
+                 temperature: float = 0.1, num_ctx: int | None = None):
         self.ollama_url = ollama_url
         self.model = model
         self.timeout = timeout
         self.temperature = temperature
+        # Context window defaults to 16384 (was a hardcoded 8192 that silently
+        # truncated multi-page documents). Overridable per deployment via
+        # BRUNS_LLM_NUM_CTX so operators can match their model's real window.
+        if num_ctx is None:
+            try:
+                num_ctx = int(os.environ.get("BRUNS_LLM_NUM_CTX", "16384") or "16384")
+            except ValueError:
+                num_ctx = 16384
         self.num_ctx = num_ctx
+        # Reuse a single connection pool instead of opening a fresh TCP
+        # connection for every generate/retry call.
+        self._session = requests.Session()
 
     def _post_generate(self, prompt: str, force_json: bool = True) -> str:
         """POST to Ollama and return raw response string. Raises on transport error."""
@@ -81,7 +117,7 @@ class LLMClient:
             # Ollama-supported JSON-mode hint. Drastically reduces drift.
             payload["format"] = "json"
 
-        r = requests.post(self.ollama_url, json=payload, timeout=self.timeout)
+        r = self._session.post(self.ollama_url, json=payload, timeout=self.timeout)
         r.raise_for_status()
         return r.json().get("response", "")
 

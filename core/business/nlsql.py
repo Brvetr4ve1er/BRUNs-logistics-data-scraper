@@ -76,6 +76,15 @@ FORBIDDEN_SQL_KEYWORDS: frozenset[str] = frozenset({
     "REPLACE", "UPSERT", "MERGE", "REINDEX", "ANALYZE",
 })
 
+# SQLite functions that can touch the filesystem, load native code, or otherwise
+# escape a read-only SELECT. These are valid tokens inside an otherwise-innocent
+# SELECT, so keyword-prefix checks miss them — block them by name.
+FORBIDDEN_SQL_FUNCTIONS: frozenset[str] = frozenset({
+    "LOAD_EXTENSION", "READFILE", "WRITEFILE", "EDITDIST3",
+    "FTS3_TOKENIZER", "ZIPFILE", "SQLITE_COMPILEOPTION_USED",
+    "SQLITE_COMPILEOPTION_GET",
+})
+
 _TOKEN_RE = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*\b")
 
 
@@ -87,12 +96,17 @@ def validate_select(sql: str) -> tuple[bool, str | None, str]:
     """
     cleaned = sql.strip().rstrip(";").strip()
     upper = cleaned.upper()
+    # Reject SQL comments outright: a legitimate generated SELECT never needs
+    # them, and they are the classic vehicle for smuggling payloads past a
+    # token scan (e.g. hiding a chained statement behind `--`).
+    if "--" in cleaned or "/*" in cleaned:
+        return False, "SQL comments are not permitted.", cleaned
     if not upper.startswith("SELECT") and not upper.startswith("WITH"):
         return False, f"Generated SQL must start with SELECT/WITH: {sql[:80]}", cleaned
     if ";" in cleaned:
         return False, "Statement chaining is not permitted.", cleaned
     tokens = set(_TOKEN_RE.findall(upper))
-    blocked = tokens & FORBIDDEN_SQL_KEYWORDS
+    blocked = tokens & (FORBIDDEN_SQL_KEYWORDS | FORBIDDEN_SQL_FUNCTIONS)
     if blocked:
         return False, f"Forbidden keyword(s) in generated SQL: {', '.join(sorted(blocked))}", cleaned
     return True, None, cleaned
